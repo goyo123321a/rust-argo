@@ -1,0 +1,101 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Docker镜像名称 (默认: go-argo)'
+        required: false
+        default: 'rust-argo'
+        type: string
+      image_tag:
+        description: 'Docker镜像标签 (默认: latest)'
+        required: false
+        default: 'latest'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=HTTP Server
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check image size
+        run: |
+          # 拉取刚构建的镜像检查大小
+          docker pull ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }}
+          
+          echo "=== 镜像大小检查 ==="
+          echo "镜像名称: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          echo ""
+          
+          # 检查镜像详细信息，包括大小
+          docker image inspect ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --format='{{printf "%-30s %s" "镜像ID:" .Id}}'
+          
+          docker image inspect ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --format='{{printf "%-30s %s" "创建时间:" .Created}}'
+          
+          # 获取镜像大小（字节）
+          SIZE_BYTES=$(docker image inspect ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --format='{{.Size}}')
+          
+          # 转换为更易读的格式
+          echo "镜像大小:"
+          echo "  - 字节: $SIZE_BYTES"
+          
+          # 计算不同单位的大小
+          if [ $SIZE_BYTES -ge 1073741824 ]; then
+            # GB
+            SIZE_GB=$(echo "scale=2; $SIZE_BYTES/1073741824" | bc)
+            echo "  - GB: $SIZE_GB"
+          elif [ $SIZE_BYTES -ge 1048576 ]; then
+            # MB
+            SIZE_MB=$(echo "scale=2; $SIZE_BYTES/1048576" | bc)
+            echo "  - MB: $SIZE_MB"
+          elif [ $SIZE_BYTES -ge 1024 ]; then
+            # KB
+            SIZE_KB=$(echo "scale=2; $SIZE_BYTES/1024" | bc)
+            echo "  - KB: $SIZE_KB"
+          fi
+          
+          echo ""
+          echo "镜像层信息:"
+          # 显示镜像层信息
+          docker history ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}:${{ inputs.image_tag }} \
+            --format "table {{.CreatedBy}}\t{{.Size}}\t{{.Comment}}" \
+            --no-trunc
+            
+          echo ""
+          echo "=== 镜像大小分析完成 ==="
