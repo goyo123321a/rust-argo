@@ -47,7 +47,7 @@ impl Config {
         // PORT：优先 SERVER_PORT，其次 PORT，默认 3000
         let port_str = env::var("SERVER_PORT")
             .or_else(|_| env::var("PORT"))
-            .unwrap_or_else(|_| "3000".to_string());
+            .unwrap_or_else(|_| "7860".to_string());
 
         Self {
             upload_url: get_env("UPLOAD_URL", ""),
@@ -55,7 +55,7 @@ impl Config {
             auto_access: auto == "true",
             file_path: get_env("FILE_PATH", ".tmp").into(),
             sub_path: get_env("SUB_PATH", "sub"),
-            port: port_str.parse().unwrap_or(3000),
+            port: port_str.parse().unwrap_or(7860),
             uuid: get_env("UUID", "9afd1229-b893-40c1-84dd-51e7ce204913"),
             nezha_server: get_env("NEZHA_SERVER", ""),
             nezha_port: get_env("NEZHA_PORT", ""),
