@@ -8,19 +8,19 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::json;
 use std::env;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;  // ← 修复 set_mode 问题
 use std::path::PathBuf;
 use std::process::Command;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};  // 移除未使用的 error
 
-// ---------- 辅助函数：统一读取环境变量 ----------
+// ---------- 辅助函数 ----------
 fn get_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-// ---------- 全局配置结构 ----------
+// ---------- Config ----------
 struct Config {
     upload_url: String,
     project_url: String,
@@ -43,12 +43,9 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         let auto = get_env("AUTO_ACCESS", "false");
-
-        // PORT：优先 SERVER_PORT，其次 PORT，默认 3000
         let port_str = env::var("SERVER_PORT")
             .or_else(|_| env::var("PORT"))
             .unwrap_or_else(|_| "7860".to_string());
-
         Self {
             upload_url: get_env("UPLOAD_URL", ""),
             project_url: get_env("PROJECT_URL", ""),
@@ -70,7 +67,7 @@ impl Config {
     }
 }
 
-// ---------- 工具函数 ----------
+// ---------- 工具 ----------
 fn random_name() -> String {
     rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -98,7 +95,7 @@ async fn download_file(client: &Client, url: &str, dest: &PathBuf) -> anyhow::Re
     Ok(())
 }
 
-// ---------- Xray 配置文件生成 ----------
+// ---------- Xray 配置 ----------
 fn write_xray_config(dir: &PathBuf, uuid: &str, argo_port: u16) -> anyhow::Result<()> {
     let path = dir.join("config.json");
     let content = format!(
@@ -174,7 +171,7 @@ fn write_xray_config(dir: &PathBuf, uuid: &str, argo_port: u16) -> anyhow::Resul
     Ok(())
 }
 
-// ---------- 获取 IP 信息 ----------
+// ---------- IP 信息 ----------
 async fn get_isp_info(client: &Client) -> String {
     let url = "http://ip-api.com/json?fields=status,countryCode,isp";
     match client.get(url).timeout(Duration::from_secs(5)).send().await {
@@ -192,7 +189,7 @@ async fn get_isp_info(client: &Client) -> String {
     "Unknown".to_string()
 }
 
-// ---------- 生成订阅（Base64）----------
+// ---------- 生成订阅 ----------
 async fn generate_sub(config: &Config, argo_domain: &str) -> anyhow::Result<String> {
     let client = Client::new();
     let isp = get_isp_info(&client).await;
@@ -239,18 +236,14 @@ async fn generate_sub(config: &Config, argo_domain: &str) -> anyhow::Result<Stri
     let plain = format!("{}\n{}\n{}\n", vless, vmess, trojan);
     let b64 = base64::engine::general_purpose::STANDARD.encode(plain.as_bytes());
 
-    // 保存订阅文件（Base64）
     let sub_file = config.file_path.join(format!("{}.txt", config.sub_path));
     tokio::fs::write(&sub_file, &b64).await?;
-
-    // 同时保存明文 list.txt（用于上传节点列表，兼容原脚本）
     let list_file = config.file_path.join("list.txt");
     tokio::fs::write(&list_file, &plain).await?;
-
     Ok(b64)
 }
 
-// ---------- 提取 Argo 临时域名 ----------
+// ---------- 提取 Argo 域名 ----------
 async fn extract_argo_domain(dir: &PathBuf) -> Option<String> {
     let log_path = dir.join("boot.log");
     for _ in 0..30 {
@@ -271,14 +264,14 @@ async fn extract_argo_domain(dir: &PathBuf) -> Option<String> {
     None
 }
 
-// ---------- 启动后台子进程（detach）----------
+// ---------- 后台启动 ----------
 fn spawn_detached(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     let full_cmd = format!("nohup {} {} >/dev/null 2>&1 &", cmd, args.join(" "));
     Command::new("sh").arg("-c").arg(&full_cmd).spawn()?;
     Ok(())
 }
 
-// ---------- 启动所有服务 ----------
+// ---------- 启动服务 ----------
 async fn start_services(config: &Config) -> anyhow::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let dir = &config.file_path;
     let arch = get_arch();
@@ -294,7 +287,6 @@ async fn start_services(config: &Config) -> anyhow::Result<(PathBuf, PathBuf, Pa
     let npm_path = dir.join(&npm_name);
     let php_path = dir.join(&php_name);
 
-    // 下载核心文件
     let web_url = format!("https://{}.ssss.nyc.mn/web", arch);
     let bot_url = format!("https://{}.ssss.nyc.mn/bot", arch);
     download_file(&client, &web_url, &web_path).await?;
@@ -311,35 +303,32 @@ async fn start_services(config: &Config) -> anyhow::Result<(PathBuf, PathBuf, Pa
         }
     }
 
-    // 添加执行权限
+    // 加执行权限
     for path in [&web_path, &bot_path, &npm_path, &php_path] {
         if path.exists() {
             let mut perms = fs::metadata(path)?.permissions();
-            perms.set_mode(0o755);
+            perms.set_mode(0o755); // ← 现在可用，因为引入了 PermissionsExt
             fs::set_permissions(path, perms)?;
         }
     }
 
-    // 写 Xray 配置
     write_xray_config(dir, &config.uuid, config.argo_port)?;
 
-    // 启动 Xray
+    // Xray
     spawn_detached(
         web_path.to_str().unwrap(),
         &["-c", dir.join("config.json").to_str().unwrap()],
     )?;
 
-    // 启动 cloudflared
+    // cloudflared
     let argo_cmd = if !config.argo_auth.is_empty() {
         if config.argo_auth.len() > 100 {
-            // token
             format!(
                 "{} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {}",
                 bot_path.display(),
                 config.argo_auth
             )
         } else if config.argo_auth.contains("TunnelSecret") {
-            // JSON credentials
             let json_path = dir.join("tunnel.json");
             fs::write(&json_path, &config.argo_auth)?;
             let yaml_content = format!(
@@ -367,7 +356,6 @@ ingress:
                 yaml_path.display()
             )
         } else {
-            // 临时隧道（带日志）
             format!(
                 "{} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {} --loglevel info --url http://localhost:{}",
                 bot_path.display(),
@@ -376,7 +364,6 @@ ingress:
             )
         }
     } else {
-        // 无认证，临时隧道
         format!(
             "{} tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {} --loglevel info --url http://localhost:{}",
             bot_path.display(),
@@ -389,7 +376,7 @@ ingress:
         .arg(format!("nohup {} >/dev/null 2>&1 &", argo_cmd))
         .spawn()?;
 
-    // 启动 Nezha
+    // Nezha
     if nezha_enabled {
         if !config.nezha_port.is_empty() {
             let tls_opt = if ["443", "8443", "2096", "2087", "2083", "2053"].contains(&config.nezha_port.as_str()) {
@@ -407,7 +394,6 @@ ingress:
             );
             spawn_detached(&cmd, &[])?;
         } else {
-            // v1 模式
             let yaml_path = dir.join("config.yaml");
             let yaml_content = format!(
                 r#"client_secret: {}
@@ -432,7 +418,7 @@ tls: {}
     Ok((web_path, bot_path, npm_path, php_path))
 }
 
-// ---------- 删除历史节点（通过 API）----------
+// ---------- 删除旧节点 ----------
 async fn delete_nodes(config: &Config) -> anyhow::Result<()> {
     if config.upload_url.is_empty() {
         return Ok(());
@@ -486,7 +472,7 @@ async fn upload_subscription(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------- 自动访问保活 ----------
+// ---------- 自动访问 ----------
 async fn add_visit_task(config: &Config) -> anyhow::Result<()> {
     if !config.auto_access || config.project_url.is_empty() {
         return Ok(());
@@ -502,7 +488,7 @@ async fn add_visit_task(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------- 90秒后清理文件 ----------
+// ---------- 清理文件 ----------
 fn schedule_cleanup(dir: PathBuf, files: Vec<PathBuf>) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(90)).await;
@@ -512,7 +498,6 @@ fn schedule_cleanup(dir: PathBuf, files: Vec<PathBuf>) {
                 info!("Cleaned up: {}", file.display());
             }
         }
-        // 也删除一些日志和配置
         let to_remove = ["config.json", "tunnel.json", "tunnel.yml", "config.yaml", "boot.log"];
         for name in to_remove {
             let p = dir.join(name);
@@ -535,10 +520,11 @@ async fn run_http_server(config: Config, sub_content: String) -> anyhow::Result<
         .route(&format!("/{}", sub_path), get({
             let sub = sub_content.clone();
             move || async move {
+                // 现在返回 String，通过克隆 Arc 内部数据
                 (
                     axum::http::StatusCode::OK,
                     [("Content-Type", "text/plain; charset=utf-8")],
-                    sub.as_str(),
+                    sub.to_string(),  // ← 返回拥有所有权的 String
                 )
             }
         }));
@@ -549,18 +535,17 @@ async fn run_http_server(config: Config, sub_content: String) -> anyhow::Result<
     Ok(())
 }
 
-// ---------- 主函数 ----------
+// ---------- main ----------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = Config::from_env();
 
-    // 创建工作目录
     tokio::fs::create_dir_all(&config.file_path).await?;
     std::env::set_current_dir(&config.file_path)?;
 
-    // 清理旧文件（启动时清空工作目录）
+    // 清理工作目录（启动时清空）
     if let Ok(entries) = fs::read_dir(&config.file_path) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -570,13 +555,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 删除历史节点（通过 API）
     delete_nodes(&config).await?;
 
-    // 启动服务（获得各二进制路径）
     let (web_path, bot_path, npm_path, php_path) = start_services(&config).await?;
 
-    // 获取 Argo 域名
     let argo_domain = if !config.argo_domain.is_empty() {
         config.argo_domain.clone()
     } else {
@@ -586,16 +568,11 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Argo domain: {}", argo_domain);
 
-    // 生成订阅
     let sub_b64 = generate_sub(&config, &argo_domain).await?;
 
-    // 上传订阅
     upload_subscription(&config).await?;
-
-    // 保活任务
     add_visit_task(&config).await?;
 
-    // 调度 90 秒后清理二进制和配置文件
     let mut files_to_clean = vec![web_path, bot_path];
     if !config.nezha_server.is_empty() && !config.nezha_key.is_empty() {
         if !config.nezha_port.is_empty() {
@@ -606,7 +583,6 @@ async fn main() -> anyhow::Result<()> {
     }
     schedule_cleanup(config.file_path.clone(), files_to_clean);
 
-    // 启动 HTTP 服务器（阻塞）
     run_http_server(config, sub_b64).await?;
 
     Ok(())
