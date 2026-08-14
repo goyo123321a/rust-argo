@@ -17,5 +17,5 @@ WORKDIR /app
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/proxy-deployer /usr/local/bin/proxy-deployer
 # 可选：COPY index.html /app/index.html
 RUN mkdir -p /app/.tmp && chmod 755 /app/.tmp
-EXPOSE 3000
+EXPOSE 7860
 ENTRYPOINT ["/usr/local/bin/proxy-deployer"]
