@@ -1,13 +1,12 @@
-//! 完整代理部署脚本 - Rust 移植版（最终稳定版）
-//! 完全等价于 Node.js 原版，并增强容错、重试、日志控制。
+//! 完整代理部署脚本 - Rust 移植版（最终可编译版本）
+//! 完全等价于 Node.js 原版，增强容错与重试。
 
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use axum::{routing::get, Router, response::IntoResponse};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use dotenvy::dotenv;
@@ -18,10 +17,10 @@ use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::sleep;
-use tracing::{info, warn, error};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, prelude::*, filter::EnvFilter};
 
-// ---------- 统一配置加载 ----------
+// ---------- 配置加载 ----------
 fn get_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -76,7 +75,7 @@ impl Config {
             auto_access: get_env_bool("AUTO_ACCESS", "false"),
             file_path: get_env("FILE_PATH", ".tmp"),
             sub_path: get_env("SUB_PATH", "sub"),
-            port: port_str.parse().unwrap_or(3000),
+            port: port_str.parse().unwrap_or(7860),
             uuid: get_env("UUID", "9afd1229-b893-40c1-84dd-51e7ce204913"),
             nezha_server: get_env("NEZHA_SERVER", ""),
             nezha_port: get_env("NEZHA_PORT", ""),
@@ -97,7 +96,6 @@ impl Config {
     }
 }
 
-// ---------- 工具函数 ----------
 fn is_valid_port(s: &str) -> bool {
     if s.is_empty() { return false; }
     s.parse::<u16>().is_ok()
@@ -115,23 +113,22 @@ fn generate_x25519_keypair() -> (String, String) {
     let rng = ring::rand::SystemRandom::new();
     let private = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
     let public = private.compute_public_key().unwrap();
-    let priv_bytes = private.bytes().to_vec();
+    let priv_bytes = private.as_ref().to_vec();
     let pub_bytes = public.as_ref().to_vec();
     let priv_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&priv_bytes);
     let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pub_bytes);
     (priv_b64, pub_b64)
 }
 
-// ---------- 证书生成（Hysteria2） ----------
+// ---------- 证书生成 ----------
 fn generate_tls_cert() -> (String, String) {
     use rcgen::{Certificate, CertificateParams};
     let params = CertificateParams::default();
     let cert = Certificate::from_params(params).unwrap();
     let key_pair = cert.get_key_pair();
-    (cert.pem(), key_pair.serialize_pem())
+    (cert.serialize_pem().unwrap(), key_pair.serialize_pem())
 }
 
-// ---------- 获取系统架构 ----------
 fn get_arch() -> &'static str {
     match env::consts::ARCH {
         "arm" | "aarch64" => "arm",
@@ -139,7 +136,6 @@ fn get_arch() -> &'static str {
     }
 }
 
-// ---------- 下载文件 ----------
 async fn download_file(client: &Client, url: &str, dest: &Path) -> Result<()> {
     info!("Downloading {} to {}", url, dest.display());
     let resp = client.get(url).send().await?.error_for_status()?;
@@ -148,14 +144,13 @@ async fn download_file(client: &Client, url: &str, dest: &Path) -> Result<()> {
     file.write_all(&bytes).await?;
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(dest)?.permissions();
+        let mut perms = std::fs::metadata(dest)?.permissions();
         perms.set_mode(0o775);
-        fs::set_permissions(dest, perms)?;
+        std::fs::set_permissions(dest, perms)?;
     }
     Ok(())
 }
 
-// ---------- 后台运行进程 ----------
 async fn run_bg(cmd: &Path, args: &[&str]) -> Result<()> {
     let mut child = Command::new(cmd)
         .args(args)
@@ -166,7 +161,6 @@ async fn run_bg(cmd: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-// ---------- 删除历史节点（静默处理） ----------
 async fn delete_nodes(cfg: &Config, sub_path: &Path) -> Result<()> {
     if cfg.upload_url.is_empty() || !sub_path.exists() {
         return Ok(());
@@ -199,7 +193,7 @@ async fn delete_nodes(cfg: &Config, sub_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------- 生成 Xray 配置文件 ----------
+// ---------- 生成 Xray 配置 ----------
 fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_path: &Path) -> Result<serde_json::Value> {
     let mut inbounds = vec![
         json!({
@@ -256,7 +250,6 @@ fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_p
         }),
     ];
 
-    // Reality
     if is_valid_port(&cfg.reality_port) {
         inbounds.push(json!({
             "tag": "vless-reality-in",
@@ -282,10 +275,9 @@ fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_p
         }));
     }
 
-    // Hysteria2
     if is_valid_port(&cfg.hy2_port) {
-        let cert_pem = fs::read_to_string(cert_path)?;
-        let key_pem = fs::read_to_string(key_path)?;
+        let _cert_pem = fs::read_to_string(cert_path)?;
+        let _key_pem = fs::read_to_string(key_path)?;
         inbounds.push(json!({
             "tag": "hysteria-in",
             "listen": "::",
@@ -310,7 +302,6 @@ fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_p
         }));
     }
 
-    // SOCKS5
     if is_valid_port(&cfg.s5_port) {
         inbounds.push(json!({
             "tag": "s5-in",
@@ -336,19 +327,17 @@ fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_p
     }))
 }
 
-// ---------- 生成订阅内容 ----------
+// ---------- 生成订阅 ----------
 async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public_key: &str) -> Result<String> {
-    let isp = get_meta_info().await.unwrap_or_else(|| "Unknown".into());
+    let isp = get_meta_info().await.unwrap_or_else(|_| "Unknown".into());
     let node_name = if cfg.name.is_empty() { isp.clone() } else { format!("{}-{}", cfg.name, isp) };
     let mut lines = vec![];
 
-    // VLESS (ws)
     lines.push(format!(
         "vless://{}@{}:{}?encryption=none&security=tls&sni={}&fp=firefox&type=ws&host={}&path=%2Fvless-argo%3Fed%3D2560#{}",
         cfg.uuid, cfg.cfip, cfg.cfport, argo_domain, argo_domain, node_name
     ));
 
-    // VMess
     let vmess = json!({
         "v": "2",
         "ps": node_name,
@@ -369,13 +358,11 @@ async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public
     let vmess_b64 = BASE64.encode(serde_json::to_string(&vmess).unwrap());
     lines.push(format!("vmess://{}", vmess_b64));
 
-    // Trojan
     lines.push(format!(
         "trojan://{}@{}:{}?security=tls&sni={}&fp=firefox&type=ws&host={}&path=%2Ftrojan-argo%3Fed%3D2560#{}",
         cfg.uuid, cfg.cfip, cfg.cfport, argo_domain, argo_domain, node_name
     ));
 
-    // Hysteria2
     if is_valid_port(&cfg.hy2_port) {
         let fingerprint = get_cert_fingerprint(&format!("{}/cert.pem", cfg.file_path)).await?;
         let fp_param = if fingerprint.is_empty() { "".into() } else { format!("&pinSHA256={}", fingerprint) };
@@ -385,7 +372,6 @@ async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public
         ));
     }
 
-    // Reality
     if is_valid_port(&cfg.reality_port) {
         lines.push(format!(
             "vless://{}@{}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={}&type=tcp&headerType=none#{}",
@@ -393,7 +379,6 @@ async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public
         ));
     }
 
-    // SOCKS5
     if is_valid_port(&cfg.s5_port) {
         let user = &cfg.uuid[0..8];
         let pass = &cfg.uuid[cfg.uuid.len()-12..];
@@ -407,7 +392,7 @@ async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public
     Ok(lines.join("\n"))
 }
 
-// ---------- 获取证书指纹（失败返回空字符串） ----------
+// ---------- 证书指纹 ----------
 async fn get_cert_fingerprint(cert_path: &str) -> Result<String> {
     let data = match fs::read_to_string(cert_path).await {
         Ok(d) => d,
@@ -474,8 +459,8 @@ async fn get_meta_info() -> Result<String> {
     bail!("Failed to get meta info")
 }
 
-// ---------- 上传节点/订阅 ----------
-async fn upload_nodes(cfg: &Config, sub_content: &str, list_content: &str) -> Result<()> {
+// ---------- 上传节点 ----------
+async fn upload_nodes(cfg: &Config, _sub_content: &str, list_content: &str) -> Result<()> {
     if cfg.upload_url.is_empty() { return Ok(()); }
     let client = Client::new();
     if !cfg.project_url.is_empty() {
@@ -503,7 +488,7 @@ async fn upload_nodes(cfg: &Config, sub_content: &str, list_content: &str) -> Re
     Ok(())
 }
 
-// ---------- Telegram 推送 ----------
+// ---------- Telegram ----------
 async fn send_telegram(cfg: &Config, sub_b64: &str) -> Result<()> {
     if cfg.bot_token.is_empty() || cfg.chat_id.is_empty() { return Ok(()); }
     let client = Client::new();
@@ -517,7 +502,6 @@ async fn send_telegram(cfg: &Config, sub_b64: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------- 自动保活 ----------
 async fn add_visit_task(cfg: &Config) -> Result<()> {
     if !cfg.auto_access || cfg.project_url.is_empty() { return Ok(()); }
     let client = Client::new();
@@ -530,14 +514,13 @@ async fn add_visit_task(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-// ---------- 清理文件 ----------
 async fn cleanup_files(paths: &[PathBuf]) {
     for p in paths {
         let _ = fs::remove_file(p).await;
     }
 }
 
-// ---------- 主流程 ----------
+// ---------- 主函数 ----------
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -581,7 +564,7 @@ async fn main() -> Result<()> {
         fs::write(&key_file, key_pem).await?;
     }
 
-    let (private_key, public_key) = if is_valid_port(&cfg.reality_port) {
+    let (private_key_str, public_key_str) = if is_valid_port(&cfg.reality_port) {
         let (priv, pub) = generate_x25519_keypair();
         let key_file_path = base_path.join("key.txt");
         fs::write(key_file_path, format!("PrivateKey: {}\nPublicKey: {}\n", priv, pub)).await?;
@@ -590,7 +573,7 @@ async fn main() -> Result<()> {
         ("".into(), "".into())
     };
 
-    let config_json = generate_xray_config(&cfg, &private_key, &cert_file, &key_file)?;
+    let config_json = generate_xray_config(&cfg, &private_key_str, &cert_file, &key_file)?;
     fs::write(&config_file, serde_json::to_string_pretty(&config_json)?).await?;
 
     let arch = get_arch();
@@ -637,7 +620,7 @@ async fn main() -> Result<()> {
             if ["443","8443","2096","2087","2083","2053"].contains(&cfg.nezha_port.as_str()) {
                 args.push("--tls");
             }
-            run_bg(&npm_path, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await?;
+            run_bg(&npm_path, &args.iter().map(|s| *s).collect::<Vec<&str>>()).await?;
         }
         info!("Nezha agent started");
     }
@@ -647,7 +630,6 @@ async fn main() -> Result<()> {
         if cfg.argo_auth.len() >= 120 && cfg.argo_auth.len() <= 250 && cfg.argo_auth.chars().all(|c| c.is_ascii_alphanumeric() || c == '=') {
             argo_args.extend_from_slice(&["run", "--token", &cfg.argo_auth]);
         } else if cfg.argo_auth.contains("TunnelSecret") {
-            // 容错解析
             let tunnel_id = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cfg.argo_auth) {
                 json_val["TunnelSecret"]["tunnel_id"]
                     .as_str()
@@ -677,7 +659,7 @@ async fn main() -> Result<()> {
     } else {
         argo_args.extend_from_slice(&["--logfile", boot_log.to_str().unwrap(), "--loglevel", "info", "--url", &format!("http://localhost:{}", cfg.argo_port)]);
     }
-    run_bg(&bot_path, &argo_args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await?;
+    run_bg(&bot_path, &argo_args.iter().map(|s| *s).collect::<Vec<&str>>()).await?;
     info!("Argo tunnel started");
 
     sleep(Duration::from_secs(6)).await;
@@ -704,7 +686,7 @@ async fn main() -> Result<()> {
     let server_ip = get_server_ip().await?;
     info!("Server IP: {}", server_ip);
 
-    let list_content = generate_links(&cfg, &argo_domain, &server_ip, &public_key).await?;
+    let list_content = generate_links(&cfg, &argo_domain, &server_ip, &public_key_str).await?;
     let sub_b64 = BASE64.encode(&list_content);
     fs::write(&sub_file, &sub_b64).await?;
     fs::write(&list_file, &list_content).await?;
@@ -724,9 +706,9 @@ async fn main() -> Result<()> {
         let app = Router::new()
             .route(&format!("/{}", sub_path_route), get(move || async move {
                 if sub_content.is_empty() {
-                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not ready")
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not ready".to_string())
                 } else {
-                    (axum::http::StatusCode::OK, sub_content)
+                    (axum::http::StatusCode::OK, sub_content.clone())
                 }
             }))
             .route("/", get(move || async move {
@@ -734,10 +716,8 @@ async fn main() -> Result<()> {
             }));
         let addr = format!("0.0.0.0:{}", port).parse().unwrap();
         info!("HTTP server running on {}", addr);
-        axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
 
     upload_nodes(&cfg, &sub_b64, &list_content).await?;
