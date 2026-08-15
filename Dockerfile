@@ -1,39 +1,55 @@
-# 构建阶段
+# ========== 第一阶段：构建 ==========
 FROM rust:alpine AS builder
 
-# 安装 musl 开发工具（确保静态链接）
+# 安装 musl 工具链（Alpine 默认已带，但需要确保）
 RUN apk add --no-cache musl-dev
 
+# 设置工作目录
 WORKDIR /app
 
-# 复制依赖清单并构建依赖层（缓存）
-COPY Cargo.toml .
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
+# 复制依赖清单以利用 Docker 缓存
+COPY Cargo.toml Cargo.lock ./
 
-# 复制真实源代码并构建
+# 创建虚拟 main.rs 以构建依赖层（避免重复编译）
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src target/release/deps/rust_node2go*
+
+# 复制真实源码并构建
 COPY src ./src
 RUN cargo build --release
 
-# 运行阶段
+# ========== 第二阶段：运行镜像 ==========
 FROM alpine:latest
 
-# 安装 CA 证书（用于 HTTPS 请求）
-RUN apk add --no-cache ca-certificates
+# 安装常用工具（与 Node 版本保持一致）
+RUN apk add --no-cache \
+    openssl \
+    curl \
+    bash \
+    wget \
+    gcompat \
+    iproute2 \
+    coreutils
 
-WORKDIR /app
+# 创建非 root 用户（与 Node 版本一致）
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 -G nodejs
 
-# 从构建阶段复制二进制（无需指定目标三元组，因为构建器本机编译）
-COPY --from=builder /app/target/release/proxy-deployer /usr/local/bin/proxy-deployer
+# 设置工作目录（与 Node 版本一致）
+WORKDIR /tmp
 
-# 可选：复制自定义 index.html（若需要）
-# COPY index.html /app/index.html
+# 从构建阶段复制编译好的二进制
+COPY --from=builder /app/target/release/rust-node2go /usr/local/bin/app
 
-# 创建工作目录
-RUN mkdir -p /app/.tmp && chmod 755 /app/.tmp
+# 设置权限（确保可执行）
+RUN chmod +x /usr/local/bin/app
 
-# 暴露端口
+# 切换到非 root 用户
+USER nodejs
+
+# 暴露端口（与 Node 版本一致）
 EXPOSE 7860
 
-# 启动
-ENTRYPOINT ["/usr/local/bin/proxy-deployer"]
+# 启动应用
+CMD ["/usr/local/bin/app"]
