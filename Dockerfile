@@ -1,12 +1,15 @@
 # ========== 第一阶段：构建 ==========
 FROM rust:alpine AS builder
 
-# 安装 musl 工具链
-RUN apk add --no-cache musl-dev
+# 安装 musl 工具链、OpenSSL 开发库和 pkg-config
+RUN apk add --no-cache musl-dev openssl-dev pkgconfig
+
+# 设置环境变量，避免交叉编译相关问题（可选）
+ENV PKG_CONFIG_ALLOW_CROSS=1
 
 WORKDIR /app
 
-# 1. 仅复制 Cargo.toml（不依赖 Cargo.lock）
+# 1. 仅复制 Cargo.toml
 COPY Cargo.toml ./
 
 # 2. 创建虚拟 main.rs 以触发依赖下载
