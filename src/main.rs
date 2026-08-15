@@ -1,81 +1,89 @@
-//! 完整代理部署脚本 - Rust 移植版（最终可编译版本）
-//! 完全等价于 Node.js 原版，增强容错与重试。
-
+// ========== 依赖导入 ==========
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chrono::Utc;
+use rand::rngs::OsRng;
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256};
+use reqwest::Client;
+use serde_json::{json, Value};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-
-use anyhow::{bail, Result};
-use axum::{routing::get, Router, response::IntoResponse};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use dotenvy::dotenv;
-use rand::Rng;
-use reqwest::Client;
-use serde_json::json;
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::fs as tokio_fs;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{info, warn};
-use tracing_subscriber::{fmt, prelude::*, filter::EnvFilter};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+use x25519_dalek::{PublicKey, StaticSecret};
+use x509_parser::parse_x509_certificate;
 
-// ---------- 配置加载 ----------
+// ========== 辅助函数（环境变量） ==========
 fn get_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn get_env_bool(key: &str, default: &str) -> bool {
+    let val = env::var(key).unwrap_or_else(|_| default.to_string());
+    match val.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => default.parse().unwrap_or(false),
+    }
 }
 
 fn get_env_u16(key: &str, default: &str) -> u16 {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| default.parse().expect("default must be a valid u16"))
+        .unwrap_or_else(|| default.parse().unwrap_or(0))
 }
 
-fn get_env_bool(key: &str, default: &str) -> bool {
-    env::var(key)
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or_else(|_| default.parse().expect("default must be 'true' or 'false'"))
-}
-
-#[derive(Debug)]
-struct Config {
-    upload_url: String,
-    project_url: String,
-    auto_access: bool,
-    file_path: String,
-    sub_path: String,
-    port: u16,
-    uuid: String,
-    nezha_server: String,
-    nezha_port: String,
-    nezha_key: String,
-    argo_domain: String,
-    argo_auth: String,
-    argo_port: u16,
-    s5_port: String,
-    hy2_port: String,
-    reality_port: String,
-    cfip: String,
-    cfport: u16,
-    name: String,
-    chat_id: String,
-    bot_token: String,
-    show_log: bool,
+// ========== 配置结构体 ==========
+#[derive(Clone)]
+pub struct Config {
+    pub upload_url: String,
+    pub project_url: String,
+    pub auto_access: bool,
+    pub file_path: PathBuf,
+    pub sub_path: String,
+    pub port: u16,
+    pub uuid: String,
+    pub nezha_server: String,
+    pub nezha_port: String,
+    pub nezha_key: String,
+    pub argo_domain: String,
+    pub argo_auth: String,
+    pub argo_port: u16,
+    pub s5_port: String,
+    pub hy2_port: String,
+    pub reality_port: String,
+    pub cfip: String,
+    pub cfport: u16,
+    pub name: String,
+    pub chat_id: String,
+    pub bot_token: String,
+    pub show_log: bool,
 }
 
 impl Config {
-    fn from_env() -> Self {
-        let port_str = env::var("SERVER_PORT")
-            .or_else(|_| env::var("PORT"))
-            .unwrap_or_else(|_| "7860".to_string());
+    pub fn from_env() -> Self {
         Self {
             upload_url: get_env("UPLOAD_URL", ""),
             project_url: get_env("PROJECT_URL", ""),
             auto_access: get_env_bool("AUTO_ACCESS", "false"),
-            file_path: get_env("FILE_PATH", ".tmp"),
+            file_path: PathBuf::from(get_env("FILE_PATH", ".tmp")),
             sub_path: get_env("SUB_PATH", "sub"),
-            port: port_str.parse().unwrap_or(7860),
+            port: get_env_u16("SERVER_PORT", "7860"),
             uuid: get_env("UUID", "9afd1229-b893-40c1-84dd-51e7ce204913"),
             nezha_server: get_env("NEZHA_SERVER", ""),
             nezha_port: get_env("NEZHA_PORT", ""),
@@ -96,168 +104,191 @@ impl Config {
     }
 }
 
-fn is_valid_port(s: &str) -> bool {
-    if s.is_empty() { return false; }
-    s.parse::<u16>().is_ok()
+// ========== 全局状态 ==========
+#[derive(Clone)]
+struct AppState {
+    config: Config,
+    client: Client,
+    sub_content: Arc<Mutex<Option<String>>>,
 }
 
-fn random_string(len: usize) -> String {
-    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().collect();
-    let mut rng = rand::thread_rng();
-    (0..len).map(|_| chars[rng.gen_range(0..chars.len())]).collect()
-}
-
-// ---------- 密钥生成 ----------
-fn generate_x25519_keypair() -> (String, String) {
-    use ring::agreement::{EphemeralPrivateKey, X25519};
-    let rng = ring::rand::SystemRandom::new();
-    let private = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
-    let public = private.compute_public_key().unwrap();
-    let priv_bytes = private.as_ref().to_vec();
-    let pub_bytes = public.as_ref().to_vec();
-    let priv_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&priv_bytes);
-    let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pub_bytes);
-    (priv_b64, pub_b64)
-}
-
-// ---------- 证书生成 ----------
-fn generate_tls_cert() -> (String, String) {
-    use rcgen::{Certificate, CertificateParams};
-    let params = CertificateParams::default();
-    let cert = Certificate::from_params(params).unwrap();
-    let key_pair = cert.get_key_pair();
-    (cert.serialize_pem().unwrap(), key_pair.serialize_pem())
-}
-
-fn get_arch() -> &'static str {
-    match env::consts::ARCH {
-        "arm" | "aarch64" => "arm",
-        _ => "amd",
+// ========== 工具函数 ==========
+fn is_valid_port(port: &str) -> bool {
+    if port.is_empty() {
+        return false;
     }
+    port.parse::<u16>().is_ok()
 }
 
-async fn download_file(client: &Client, url: &str, dest: &Path) -> Result<()> {
-    info!("Downloading {} to {}", url, dest.display());
-    let resp = client.get(url).send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
-    let mut file = File::create(dest).await?;
-    file.write_all(&bytes).await?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dest)?.permissions();
-        perms.set_mode(0o775);
-        std::fs::set_permissions(dest, perms)?;
+async fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        tokio_fs::create_dir_all(path).await?;
     }
     Ok(())
 }
 
-async fn run_bg(cmd: &Path, args: &[&str]) -> Result<()> {
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    tokio::spawn(async move { let _ = child.wait().await; });
+// ========== 立即清理旧文件（清空 .tmp 目录） ==========
+async fn cleanup_old_files(config: &Config) -> std::io::Result<()> {
+    let dir = &config.file_path;
+    if dir.exists() {
+        tokio_fs::remove_dir_all(dir).await?;
+    }
+    tokio_fs::create_dir_all(dir).await?;
     Ok(())
 }
 
-async fn delete_nodes(cfg: &Config, sub_path: &Path) -> Result<()> {
-    if cfg.upload_url.is_empty() || !sub_path.exists() {
+// ========== 删除上游旧节点 ==========
+async fn delete_nodes(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let upload_url = &state.config.upload_url;
+    if upload_url.is_empty() {
         return Ok(());
     }
-    let content = match fs::read_to_string(sub_path).await {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-    let decoded = match BASE64.decode(&content) {
-        Ok(b) => match String::from_utf8(b) {
-            Ok(s) => s,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-    let nodes: Vec<&str> = decoded.lines()
-        .filter(|line| line.contains("vless://") || line.contains("vmess://") || line.contains("trojan://")
-            || line.contains("hysteria2://") || line.contains("socks://"))
+    let sub_path = state.config.file_path.join("sub.txt");
+    if !sub_path.exists() {
+        return Ok(());
+    }
+    let content = tokio_fs::read_to_string(&sub_path).await?;
+    let decoded = String::from_utf8(BASE64.decode(&content)?)?;
+    let nodes: Vec<&str> = decoded
+        .lines()
+        .filter(|line| line.contains("://"))
         .collect();
     if nodes.is_empty() {
         return Ok(());
     }
-    let client = Client::new();
-    let resp = client.post(format!("{}/api/delete-nodes", cfg.upload_url))
-        .json(&json!({ "nodes": nodes }))
-        .send().await?;
+    let payload = json!({ "nodes": nodes });
+    let resp = state
+        .client
+        .post(format!("{}/api/delete-nodes", upload_url))
+        .json(&payload)
+        .send()
+        .await?;
     if resp.status().is_success() {
-        info!("Deleted {} old nodes", nodes.len());
+        info!("旧节点删除成功");
+    } else {
+        warn!("旧节点删除失败: {}", resp.status());
     }
     Ok(())
 }
 
-// ---------- 生成 Xray 配置 ----------
-fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_path: &Path) -> Result<serde_json::Value> {
+// ========== 证书生成（纯 Rust） ==========
+fn generate_cert_and_key() -> (String, String) {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "bing.com");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![SanType::DnsName("bing.com".to_string())];
+    params.key_pair = Some(KeyPair::generate_for_curve(PKCS_ECDSA_P256_SHA256).unwrap());
+    params.is_ca = false;
+    params.not_before = Utc::now();
+    params.not_after = Utc::now() + chrono::Duration::days(3650);
+    let cert = Certificate::from_params(params).unwrap();
+    let cert_pem = cert.pem();
+    let key_pem = cert.serialize_private_key_pem();
+    (cert_pem, key_pem)
+}
+
+// ========== X25519 密钥对（保存到文件） ==========
+fn generate_or_load_keypair(file_path: &Path) -> (String, String) {
+    let key_file = file_path.join("key.txt");
+    if key_file.exists() {
+        let content = fs::read_to_string(&key_file).unwrap_or_default();
+        let priv_key = content
+            .lines()
+            .find(|l| l.starts_with("PrivateKey:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        let pub_key = content
+            .lines()
+            .find(|l| l.starts_with("PublicKey:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        if !priv_key.is_empty() && !pub_key.is_empty() {
+            return (priv_key, pub_key);
+        }
+    }
+    // 生成新密钥对
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = PublicKey::from(&secret);
+    let priv_b64 = base64_url::encode(secret.as_bytes());
+    let pub_b64 = base64_url::encode(public.as_bytes());
+    let content = format!("PrivateKey: {}\nPublicKey: {}\n", priv_b64, pub_b64);
+    fs::write(&key_file, content).unwrap();
+    (priv_b64, pub_b64)
+}
+
+// ========== 生成 Xray 配置文件 ==========
+async fn generate_config(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = state.config.file_path.join("config.json");
     let mut inbounds = vec![
-        json!({
+        serde_json::json!({
             "tag": "vless-fallback-in",
-            "port": cfg.argo_port,
+            "port": state.config.argo_port,
             "listen": "::",
             "protocol": "vless",
             "settings": {
-                "clients": [{ "id": cfg.uuid, "flow": "xtls-rprx-vision" }],
+                "clients": [{"id": state.config.uuid, "flow": "xtls-rprx-vision"}],
                 "decryption": "none",
                 "fallbacks": [
-                    { "dest": 3001 },
-                    { "path": "/vless-argo", "dest": 3002 },
-                    { "path": "/vmess-argo", "dest": 3003 },
-                    { "path": "/trojan-argo", "dest": 3004 }
+                    {"dest": 3001},
+                    {"path": "/vless-argo", "dest": 3002},
+                    {"path": "/vmess-argo", "dest": 3003},
+                    {"path": "/trojan-argo", "dest": 3004}
                 ]
             },
-            "streamSettings": { "network": "tcp" }
+            "streamSettings": {"network": "tcp"}
         }),
-        json!({
+        serde_json::json!({
             "tag": "vless-tcp-in",
             "port": 3001,
             "listen": "127.0.0.1",
             "protocol": "vless",
-            "settings": { "clients": [{ "id": cfg.uuid }], "decryption": "none" },
-            "streamSettings": { "network": "tcp", "security": "none" }
+            "settings": {"clients": [{"id": state.config.uuid}], "decryption": "none"},
+            "streamSettings": {"network": "tcp", "security": "none"}
         }),
-        json!({
+        serde_json::json!({
             "tag": "vless-ws-in",
             "port": 3002,
             "listen": "127.0.0.1",
             "protocol": "vless",
-            "settings": { "clients": [{ "id": cfg.uuid }], "decryption": "none" },
-            "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
-            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+            "settings": {"clients": [{"id": state.config.uuid, "level": 0}], "decryption": "none"},
+            "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/vless-argo"}},
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false}
         }),
-        json!({
+        serde_json::json!({
             "tag": "vmess-ws-in",
             "port": 3003,
             "listen": "127.0.0.1",
             "protocol": "vmess",
-            "settings": { "clients": [{ "id": cfg.uuid, "alterId": 0 }] },
-            "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
-            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+            "settings": {"clients": [{"id": state.config.uuid, "alterId": 0}]},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess-argo"}},
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false}
         }),
-        json!({
+        serde_json::json!({
             "tag": "trojan-ws-in",
             "port": 3004,
             "listen": "127.0.0.1",
             "protocol": "trojan",
-            "settings": { "clients": [{ "password": cfg.uuid }] },
-            "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/trojan-argo" } },
-            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+            "settings": {"clients": [{"password": state.config.uuid}]},
+            "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/trojan-argo"}},
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false}
         }),
     ];
 
-    if is_valid_port(&cfg.reality_port) {
-        inbounds.push(json!({
-            "tag": "vless-reality-in",
+    // Reality
+    if is_valid_port(&state.config.reality_port) {
+        let (priv_key, pub_key) = generate_or_load_keypair(&state.config.file_path);
+        let pub_path = state.config.file_path.join("public_key.txt");
+        tokio_fs::write(&pub_path, &pub_key).await?;
+        inbounds.push(serde_json::json!({
+            "tag": "vless-in",
             "listen": "::",
-            "port": cfg.reality_port.parse::<u16>().unwrap(),
+            "port": state.config.reality_port.parse::<u16>().unwrap(),
             "protocol": "vless",
             "settings": {
-                "clients": [{ "id": cfg.uuid, "flow": "xtls-rprx-vision" }],
+                "clients": [{"id": state.config.uuid, "flow": "xtls-rprx-vision"}],
                 "decryption": "none"
             },
             "streamSettings": {
@@ -268,82 +299,432 @@ fn generate_xray_config(cfg: &Config, private_key: &str, cert_path: &Path, key_p
                     "dest": "www.iij.ad.jp:443",
                     "xver": 0,
                     "serverNames": ["www.iij.ad.jp"],
-                    "privateKey": private_key,
+                    "privateKey": priv_key,
                     "shortIds": [""]
                 }
             }
         }));
     }
 
-    if is_valid_port(&cfg.hy2_port) {
-        let _cert_pem = fs::read_to_string(cert_path)?;
-        let _key_pem = fs::read_to_string(key_path)?;
-        inbounds.push(json!({
+    // Hysteria2
+    if is_valid_port(&state.config.hy2_port) {
+        let (cert_pem, key_pem) = generate_cert_and_key();
+        let cert_path = state.config.file_path.join("cert.pem");
+        let key_path = state.config.file_path.join("private.key");
+        tokio_fs::write(&cert_path, cert_pem).await?;
+        tokio_fs::write(&key_path, key_pem).await?;
+
+        inbounds.push(serde_json::json!({
             "tag": "hysteria-in",
             "listen": "::",
-            "port": cfg.hy2_port.parse::<u16>().unwrap(),
+            "port": state.config.hy2_port.parse::<u16>().unwrap(),
             "protocol": "hysteria",
             "settings": {
                 "version": 2,
-                "clients": [{ "auth": cfg.uuid }]
+                "clients": [{"auth": state.config.uuid}]
             },
             "streamSettings": {
                 "network": "hysteria",
                 "hysteriaSettings": {
                     "version": 2,
-                    "masquerade": { "type": "proxy", "url": "https://bing.com" }
+                    "masquerade": {
+                        "type": "proxy",
+                        "url": "https://bing.com"
+                    }
                 },
                 "security": "tls",
                 "tlsSettings": {
                     "alpn": ["h3"],
-                    "certificates": [{ "certificateFile": cert_path.to_str().unwrap(), "keyFile": key_path.to_str().unwrap() }]
+                    "certificates": [
+                        {
+                            "certificateFile": cert_path.to_str().unwrap(),
+                            "keyFile": key_path.to_str().unwrap()
+                        }
+                    ]
                 }
             }
         }));
     }
 
-    if is_valid_port(&cfg.s5_port) {
-        inbounds.push(json!({
+    // Socks5
+    if is_valid_port(&state.config.s5_port) {
+        inbounds.push(serde_json::json!({
             "tag": "s5-in",
             "listen": "::",
-            "port": cfg.s5_port.parse::<u16>().unwrap(),
+            "port": state.config.s5_port.parse::<u16>().unwrap(),
             "protocol": "socks",
             "settings": {
                 "auth": "password",
-                "accounts": [{ "user": &cfg.uuid[0..8], "pass": &cfg.uuid[cfg.uuid.len()-12..] }],
+                "accounts": [{
+                    "user": &state.config.uuid[0..8],
+                    "pass": &state.config.uuid[12..]
+                }],
                 "udp": true
             }
         }));
     }
 
-    Ok(json!({
-        "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+    let config = serde_json::json!({
+        "log": {"access": "/dev/null", "error": "/dev/null", "loglevel": "none"},
         "inbounds": inbounds,
-        "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+        "dns": {"servers": ["https+local://8.8.8.8/dns-query"]},
         "outbounds": [
-            { "protocol": "freedom", "tag": "direct" },
-            { "protocol": "blackhole", "tag": "block" }
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"}
         ]
-    }))
+    });
+
+    let json_str = serde_json::to_string_pretty(&config)?;
+    tokio_fs::write(config_path, json_str).await?;
+    Ok(())
 }
 
-// ---------- 生成订阅 ----------
-async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public_key: &str) -> Result<String> {
-    let isp = get_meta_info().await.unwrap_or_else(|_| "Unknown".into());
-    let node_name = if cfg.name.is_empty() { isp.clone() } else { format!("{}-{}", cfg.name, isp) };
-    let mut lines = vec![];
+// ========== 下载外部二进制 ==========
+async fn download_file(
+    client: &Client,
+    url: &str,
+    dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client.get(url).send().await?;
+    let bytes = response.bytes().await?;
+    tokio_fs::write(dest, bytes).await?;
 
-    lines.push(format!(
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dest)?.permissions();
+        perms.set_mode(0o775);
+        tokio_fs::set_permissions(dest, perms).await?;
+    }
+    Ok(())
+}
+
+fn get_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+// ========== 下载并运行所需二进制 ==========
+async fn download_and_run(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let arch = get_arch();
+    let mut tasks = vec![];
+
+    let web_url = format!("https://{}.ssss.nyc.mn/web", arch);
+    let bot_url = format!("https://{}.ssss.nyc.mn/bot", arch);
+    let web_path = state.config.file_path.join("web");
+    let bot_path = state.config.file_path.join("bot");
+    tasks.push(download_file(&state.client, &web_url, &web_path));
+    tasks.push(download_file(&state.client, &bot_url, &bot_path));
+
+    if !state.config.nezha_server.is_empty() && !state.config.nezha_key.is_empty() {
+        let nezha_port = &state.config.nezha_port;
+        if !nezha_port.is_empty() {
+            let agent_url = format!("https://{}.ssss.nyc.mn/agent", arch);
+            let agent_path = state.config.file_path.join("agent");
+            tasks.push(download_file(&state.client, &agent_url, &agent_path));
+        } else {
+            let v1_url = format!("https://{}.ssss.nyc.mn/v1", arch);
+            let v1_path = state.config.file_path.join("v1");
+            tasks.push(download_file(&state.client, &v1_url, &v1_path));
+        }
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            error!("下载失败: {}", e);
+        }
+    }
+
+    // 启动 nezha
+    if !state.config.nezha_server.is_empty() && !state.config.nezha_key.is_empty() {
+        let nezha_port = &state.config.nezha_port;
+        if !nezha_port.is_empty() {
+            let agent_path = state.config.file_path.join("agent");
+            if agent_path.exists() {
+                let mut cmd = Command::new(&agent_path);
+                cmd.arg("-s")
+                    .arg(format!("{}:{}", state.config.nezha_server, nezha_port))
+                    .arg("-p")
+                    .arg(&state.config.nezha_key)
+                    .arg("--disable-auto-update")
+                    .arg("--report-delay")
+                    .arg("4")
+                    .arg("--skip-conn")
+                    .arg("--skip-procs");
+                let tls_ports = ["443", "8443", "2096", "2087", "2083", "2053"];
+                if tls_ports.contains(&nezha_port.as_str()) {
+                    cmd.arg("--tls");
+                }
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd.spawn()?;
+                info!("agent 启动");
+            }
+        } else {
+            let v1_path = state.config.file_path.join("v1");
+            if v1_path.exists() {
+                let tls_flag = state.config.nezha_server.contains("443")
+                    || state.config.nezha_server.contains("8443")
+                    || state.config.nezha_server.contains("2096")
+                    || state.config.nezha_server.contains("2087")
+                    || state.config.nezha_server.contains("2083")
+                    || state.config.nezha_server.contains("2053");
+                let config_yaml = format!(
+                    r#"client_secret: {}
+debug: false
+disable_auto_update: true
+disable_command_execute: false
+disable_force_update: true
+disable_nat: false
+disable_send_query: false
+gpu: false
+insecure_tls: true
+ip_report_period: 1800
+report_delay: 4
+server: {}
+skip_connection_count: true
+skip_procs_count: true
+temperature: false
+tls: {}
+use_gitee_to_upgrade: false
+use_ipv6_country_code: false
+uuid: {}"#,
+                    state.config.nezha_key,
+                    state.config.nezha_server,
+                    tls_flag,
+                    state.config.uuid
+                );
+                let yaml_path = state.config.file_path.join("config.yaml");
+                tokio_fs::write(&yaml_path, config_yaml).await?;
+                let mut cmd = Command::new(&v1_path);
+                cmd.arg("-c").arg(&yaml_path);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd.spawn()?;
+                info!("v1 启动");
+            }
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    // 启动 xray
+    let web_path = state.config.file_path.join("web");
+    if web_path.exists() {
+        let config_path = state.config.file_path.join("config.json");
+        let mut cmd = Command::new(&web_path);
+        cmd.arg("-c").arg(&config_path);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.spawn()?;
+        info!("xray 启动");
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    // 启动 cloudflared
+    let bot_path = state.config.file_path.join("bot");
+    if bot_path.exists() {
+        let mut cmd = Command::new(&bot_path);
+        let argo_auth = &state.config.argo_auth;
+        let argo_domain = &state.config.argo_domain;
+        let argo_port = state.config.argo_port;
+
+        if argo_auth.starts_with("TunnelSecret") {
+            let tunnel_json_path = state.config.file_path.join("tunnel.json");
+            tokio_fs::write(&tunnel_json_path, argo_auth).await?;
+            // 正确解析 TunnelID
+            let tunnel_id = if let Ok(json) = serde_json::from_str::<Value>(argo_auth) {
+                json["TunnelID"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                // 降级：从字符串中提取
+                let parts: Vec<&str> = argo_auth.split('"').collect();
+                if parts.len() > 11 {
+                    parts[11].to_string()
+                } else {
+                    String::new()
+                }
+            };
+            let tunnel_yaml = format!(
+                r#"tunnel: {}
+credentials-file: {}
+protocol: http2
+ingress:
+  - hostname: {}
+    service: http://localhost:{}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404"#,
+                tunnel_id,
+                tunnel_json_path.to_str().unwrap(),
+                argo_domain,
+                argo_port
+            );
+            let yaml_path = state.config.file_path.join("tunnel.yml");
+            tokio_fs::write(&yaml_path, tunnel_yaml).await?;
+            cmd.arg("tunnel")
+                .arg("--edge-ip-version")
+                .arg("auto")
+                .arg("--no-autoupdate")
+                .arg("--protocol")
+                .arg("http2")
+                .arg("--config")
+                .arg(&yaml_path)
+                .arg("run");
+        } else if argo_auth.len() > 120 {
+            cmd.arg("tunnel")
+                .arg("--edge-ip-version")
+                .arg("auto")
+                .arg("--no-autoupdate")
+                .arg("--protocol")
+                .arg("http2")
+                .arg("run")
+                .arg("--token")
+                .arg(argo_auth);
+        } else {
+            let log_path = state.config.file_path.join("boot.log");
+            cmd.arg("tunnel")
+                .arg("--edge-ip-version")
+                .arg("auto")
+                .arg("--no-autoupdate")
+                .arg("--protocol")
+                .arg("http2")
+                .arg("--logfile")
+                .arg(&log_path)
+                .arg("--loglevel")
+                .arg("info")
+                .arg("--url")
+                .arg(format!("http://localhost:{}", argo_port));
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.spawn()?;
+        info!("cloudflared 启动");
+        sleep(Duration::from_secs(2)).await;
+    }
+    Ok(())
+}
+
+// ========== 获取 Argo 域名 ==========
+async fn extract_argo_domain(state: &AppState) -> Option<String> {
+    if !state.config.argo_domain.is_empty() && !state.config.argo_auth.is_empty() {
+        return Some(state.config.argo_domain.clone());
+    }
+    let log_path = state.config.file_path.join("boot.log");
+    if let Ok(content) = tokio_fs::read_to_string(&log_path).await {
+        for line in content.lines() {
+            if let Some(domain) = line
+                .split_whitespace()
+                .find(|s| s.contains("trycloudflare.com"))
+                .and_then(|s| s.strip_prefix("https://"))
+                .and_then(|s| s.strip_suffix('/'))
+            {
+                return Some(domain.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ========== 获取证书指纹 ==========
+async fn get_cert_fingerprint(cert_path: &Path) -> String {
+    if let Ok(data) = tokio_fs::read(cert_path).await {
+        if let Ok((_, cert)) = parse_x509_certificate(&data) {
+            let hash = ring::digest::digest(&ring::digest::SHA256, cert.tbs_certificate.as_ref());
+            let hex = hex::encode(hash.as_ref());
+            return hex
+                .as_bytes()
+                .chunks(2)
+                .map(|ch| std::str::from_utf8(ch).unwrap())
+                .collect::<Vec<_>>()
+                .join(":")
+                .to_uppercase();
+        }
+    }
+    String::new()
+}
+
+// ========== 获取 Meta 信息 ==========
+async fn get_meta_info(client: &Client) -> Option<String> {
+    let url = "http://ip-api.com/json";
+    if let Ok(resp) = client.get(url).timeout(Duration::from_secs(3)).send().await {
+        if let Ok(json) = resp.json::<Value>().await {
+            if json["status"] == "success" {
+                let country = json["countryCode"].as_str().unwrap_or("XX");
+                let isp = json["isp"].as_str().unwrap_or("Unknown");
+                return Some(format!("{}-{}", country, isp.replace(' ', "_")));
+            }
+        }
+    }
+    let url = "https://api.ip.sb/geoip";
+    if let Ok(resp) = client.get(url).timeout(Duration::from_secs(3)).send().await {
+        if let Ok(json) = resp.json::<Value>().await {
+            let country = json["country_code"].as_str().unwrap_or("XX");
+            let isp = json["isp"].as_str().unwrap_or("Unknown");
+            return Some(format!("{}-{}", country, isp.replace(' ', "_")));
+        }
+    }
+    Some("Unknown".to_string())
+}
+
+// ========== 获取服务器公网 IP ==========
+async fn get_server_ip() -> Option<String> {
+    let urls = ["https://ipv4.ip.sb", "https://api.ipify.org"];
+    for url in urls {
+        if let Ok(resp) = reqwest::get(url).timeout(Duration::from_secs(3)).await {
+            if let Ok(ip) = resp.text().await {
+                let trimmed = ip.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(resp) = reqwest::get("https://ipv6.ip.sb")
+        .timeout(Duration::from_secs(3))
+        .await
+    {
+        if let Ok(ip) = resp.text().await {
+            let trimmed = ip.trim();
+            if !trimmed.is_empty() {
+                return Some(format!("[{}]", trimmed));
+            }
+        }
+    }
+    Some("127.0.0.1".to_string())
+}
+
+// ========== 生成订阅内容 ==========
+async fn generate_subscription(
+    state: &AppState,
+    argo_domain: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let meta = get_meta_info(&state.client).await.unwrap_or_else(|| "Unknown".to_string());
+    let node_name = if state.config.name.is_empty() {
+        meta.clone()
+    } else {
+        format!("{}-{}", state.config.name, meta)
+    };
+    let server_ip = get_server_ip().await.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let mut sub_lines = Vec::new();
+
+    sub_lines.push(format!(
         "vless://{}@{}:{}?encryption=none&security=tls&sni={}&fp=firefox&type=ws&host={}&path=%2Fvless-argo%3Fed%3D2560#{}",
-        cfg.uuid, cfg.cfip, cfg.cfport, argo_domain, argo_domain, node_name
+        state.config.uuid,
+        state.config.cfip,
+        state.config.cfport,
+        argo_domain,
+        argo_domain,
+        node_name
     ));
 
-    let vmess = json!({
+    let vmess = serde_json::json!({
         "v": "2",
         "ps": node_name,
-        "add": cfg.cfip,
-        "port": cfg.cfport,
-        "id": cfg.uuid,
+        "add": state.config.cfip,
+        "port": state.config.cfport,
+        "id": state.config.uuid,
         "aid": "0",
         "scy": "auto",
         "net": "ws",
@@ -355,383 +736,303 @@ async fn generate_links(cfg: &Config, argo_domain: &str, server_ip: &str, public
         "alpn": "",
         "fp": "firefox"
     });
-    let vmess_b64 = BASE64.encode(serde_json::to_string(&vmess).unwrap());
-    lines.push(format!("vmess://{}", vmess_b64));
+    let vmess_b64 = BASE64.encode(serde_json::to_string(&vmess)?);
+    sub_lines.push(format!("vmess://{}", vmess_b64));
 
-    lines.push(format!(
+    sub_lines.push(format!(
         "trojan://{}@{}:{}?security=tls&sni={}&fp=firefox&type=ws&host={}&path=%2Ftrojan-argo%3Fed%3D2560#{}",
-        cfg.uuid, cfg.cfip, cfg.cfport, argo_domain, argo_domain, node_name
+        state.config.uuid,
+        state.config.cfip,
+        state.config.cfport,
+        argo_domain,
+        argo_domain,
+        node_name
     ));
 
-    if is_valid_port(&cfg.hy2_port) {
-        let fingerprint = get_cert_fingerprint(&format!("{}/cert.pem", cfg.file_path)).await?;
-        let fp_param = if fingerprint.is_empty() { "".into() } else { format!("&pinSHA256={}", fingerprint) };
-        lines.push(format!(
-            "hysteria2://{}@{}:{}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{}#{}",
-            cfg.uuid, server_ip, cfg.hy2_port, fp_param, node_name
-        ));
-    }
-
-    if is_valid_port(&cfg.reality_port) {
-        lines.push(format!(
-            "vless://{}@{}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={}&type=tcp&headerType=none#{}",
-            cfg.uuid, server_ip, cfg.reality_port, public_key, node_name
-        ));
-    }
-
-    if is_valid_port(&cfg.s5_port) {
-        let user = &cfg.uuid[0..8];
-        let pass = &cfg.uuid[cfg.uuid.len()-12..];
-        let auth = BASE64.encode(format!("{}:{}", user, pass));
-        lines.push(format!(
-            "socks://{}@{}:{}/#{}",
-            auth, server_ip, cfg.s5_port, node_name
-        ));
-    }
-
-    Ok(lines.join("\n"))
-}
-
-// ---------- 证书指纹 ----------
-async fn get_cert_fingerprint(cert_path: &str) -> Result<String> {
-    let data = match fs::read_to_string(cert_path).await {
-        Ok(d) => d,
-        Err(_) => return Ok("".into()),
-    };
-    let re = match regex::Regex::new(r"-----BEGIN CERTIFICATE-----\n([\s\S]+?)\n-----END CERTIFICATE-----") {
-        Ok(r) => r,
-        Err(_) => return Ok("".into()),
-    };
-    let captures = match re.captures(&data) {
-        Some(c) => c,
-        None => return Ok("".into()),
-    };
-    let pem = captures[1].replace('\n', "");
-    let der = match BASE64.decode(&pem) {
-        Ok(b) => b,
-        Err(_) => return Ok("".into()),
-    };
-    use ring::digest::{digest, SHA256};
-    let hash = digest(&SHA256, &der);
-    let hex = hash.as_ref().iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":");
-    Ok(hex)
-}
-
-// ---------- 获取公网 IP ----------
-async fn get_server_ip() -> Result<String> {
-    let client = Client::builder().timeout(Duration::from_secs(3)).build()?;
-    if let Ok(resp) = client.get("http://ipv4.ip.sb").send().await {
-        if let Ok(text) = resp.text().await {
-            return Ok(text.trim().into());
-        }
-    }
-    if let Ok(resp) = client.get("http://ip-api.com/json").send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(ip) = json.get("query").and_then(|v| v.as_str()) {
-                return Ok(ip.into());
-            }
-        }
-    }
-    bail!("Unable to get public IP")
-}
-
-// ---------- 获取 MetaInfo ----------
-async fn get_meta_info() -> Result<String> {
-    let client = Client::builder().timeout(Duration::from_secs(3)).build()?;
-    if let Ok(resp) = client.get("https://api.ip.sb/geoip").send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            let country = json.get("country_code").and_then(|v| v.as_str()).unwrap_or("");
-            let isp = json.get("isp").and_then(|v| v.as_str()).unwrap_or("");
-            if !country.is_empty() && !isp.is_empty() {
-                return Ok(format!("{}-{}", country, isp).replace(' ', "_"));
-            }
-        }
-    }
-    if let Ok(resp) = client.get("http://ip-api.com/json").send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            let country = json.get("countryCode").and_then(|v| v.as_str()).unwrap_or("");
-            let isp = json.get("org").and_then(|v| v.as_str()).unwrap_or("");
-            if !country.is_empty() && !isp.is_empty() {
-                return Ok(format!("{}-{}", country, isp).replace(' ', "_"));
-            }
-        }
-    }
-    bail!("Failed to get meta info")
-}
-
-// ---------- 上传节点 ----------
-async fn upload_nodes(cfg: &Config, _sub_content: &str, list_content: &str) -> Result<()> {
-    if cfg.upload_url.is_empty() { return Ok(()); }
-    let client = Client::new();
-    if !cfg.project_url.is_empty() {
-        let payload = json!({ "subscription": [ format!("{}/{}", cfg.project_url, cfg.sub_path) ] });
-        let resp = client.post(format!("{}/api/add-subscriptions", cfg.upload_url))
-            .json(&payload)
-            .send().await?;
-        if resp.status().is_success() {
-            info!("Subscription uploaded successfully");
-        }
-    } else {
-        let nodes: Vec<&str> = list_content.lines().filter(|line| {
-            line.contains("vless://") || line.contains("vmess://") || line.contains("trojan://")
-                || line.contains("hysteria2://") || line.contains("socks://")
-        }).collect();
-        if nodes.is_empty() { return Ok(()); }
-        let payload = json!({ "nodes": nodes });
-        let resp = client.post(format!("{}/api/add-nodes", cfg.upload_url))
-            .json(&payload)
-            .send().await?;
-        if resp.status().is_success() {
-            info!("Nodes uploaded successfully");
-        }
-    }
-    Ok(())
-}
-
-// ---------- Telegram ----------
-async fn send_telegram(cfg: &Config, sub_b64: &str) -> Result<()> {
-    if cfg.bot_token.is_empty() || cfg.chat_id.is_empty() { return Ok(()); }
-    let client = Client::new();
-    let escaped_name = cfg.name.replace('_', "\\_").replace('*', "\\*");
-    let text = format!("**{}节点推送**\n```\n{}\n```", escaped_name, sub_b64);
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", cfg.bot_token);
-    client.post(&url)
-        .query(&[("chat_id", cfg.chat_id.as_str()), ("text", &text), ("parse_mode", "MarkdownV2")])
-        .send().await?;
-    info!("Telegram message sent");
-    Ok(())
-}
-
-async fn add_visit_task(cfg: &Config) -> Result<()> {
-    if !cfg.auto_access || cfg.project_url.is_empty() { return Ok(()); }
-    let client = Client::new();
-    let resp = client.post("https://oooo.serv00.net/add-url")
-        .json(&json!({ "url": cfg.project_url }))
-        .send().await?;
-    if resp.status().is_success() {
-        info!("Added automatic access task");
-    }
-    Ok(())
-}
-
-async fn cleanup_files(paths: &[PathBuf]) {
-    for p in paths {
-        let _ = fs::remove_file(p).await;
-    }
-}
-
-// ---------- 主函数 ----------
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenv().ok();
-
-    let cfg = Config::from_env();
-
-    let env_filter = if cfg.show_log {
-        EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into())
-    } else {
-        EnvFilter::from_default_env().add_directive(tracing::Level::ERROR.into())
-    };
-    fmt().with_env_filter(env_filter).init();
-
-    info!("Starting proxy deployer with config: {:?}", cfg);
-
-    let base_path = Path::new(&cfg.file_path);
-    fs::create_dir_all(base_path).await?;
-
-    let web_name = random_string(6);
-    let bot_name = random_string(6);
-    let npm_name = random_string(6);
-    let php_name = random_string(6);
-    let web_path = base_path.join(&web_name);
-    let bot_path = base_path.join(&bot_name);
-    let npm_path = base_path.join(&npm_name);
-    let php_path = base_path.join(&php_name);
-    let sub_file = base_path.join("sub.txt");
-    let list_file = base_path.join("list.txt");
-    let boot_log = base_path.join("boot.log");
-    let config_file = base_path.join("config.json");
-    let cert_file = base_path.join("cert.pem");
-    let key_file = base_path.join("private.key");
-
-    delete_nodes(&cfg, &sub_file).await?;
-
-    cleanup_files(&[web_path.clone(), bot_path.clone(), npm_path.clone(), php_path.clone(), boot_log.clone(), config_file.clone()]).await;
-
-    if is_valid_port(&cfg.hy2_port) {
-        let (cert_pem, key_pem) = generate_tls_cert();
-        fs::write(&cert_file, cert_pem).await?;
-        fs::write(&key_file, key_pem).await?;
-    }
-
-    let (private_key_str, public_key_str) = if is_valid_port(&cfg.reality_port) {
-        let (priv, pub) = generate_x25519_keypair();
-        let key_file_path = base_path.join("key.txt");
-        fs::write(key_file_path, format!("PrivateKey: {}\nPublicKey: {}\n", priv, pub)).await?;
-        (priv, pub)
-    } else {
-        ("".into(), "".into())
-    };
-
-    let config_json = generate_xray_config(&cfg, &private_key_str, &cert_file, &key_file)?;
-    fs::write(&config_file, serde_json::to_string_pretty(&config_json)?).await?;
-
-    let arch = get_arch();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
-    let web_url = format!("https://{}.ssss.nyc.mn/web", arch);
-    let bot_url = format!("https://{}.ssss.nyc.mn/bot", arch);
-    download_file(&client, &web_url, &web_path).await?;
-    download_file(&client, &bot_url, &bot_path).await?;
-
-    if !cfg.nezha_server.is_empty() && !cfg.nezha_key.is_empty() {
-        let nezha_bin = if cfg.nezha_port.is_empty() {
-            format!("https://{}.ssss.nyc.mn/v1", arch)
+    if is_valid_port(&state.config.hy2_port) {
+        let cert_path = state.config.file_path.join("cert.pem");
+        let fingerprint = get_cert_fingerprint(&cert_path).await;
+        let pin = if !fingerprint.is_empty() {
+            format!("&pinSHA256={}", fingerprint)
         } else {
-            format!("https://{}.ssss.nyc.mn/agent", arch)
+            String::new()
         };
-        let dest = if cfg.nezha_port.is_empty() { &php_path } else { &npm_path };
-        download_file(&client, &nezha_bin, dest).await?;
+        sub_lines.push(format!(
+            "hysteria2://{}@{}:{}?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{}#{}",
+            state.config.uuid,
+            server_ip,
+            state.config.hy2_port,
+            pin,
+            node_name
+        ));
     }
 
-    run_bg(&web_path, &["-c", config_file.to_str().unwrap()]).await?;
-    info!("Xray started");
-
-    if !cfg.nezha_server.is_empty() && !cfg.nezha_key.is_empty() {
-        if cfg.nezha_port.is_empty() {
-            let tls = match cfg.nezha_server.split(':').last().unwrap_or("") {
-                "443" | "8443" | "2096" | "2087" | "2083" | "2053" => "true",
-                _ => "false"
-            };
-            let config_yaml = format!(
-                "client_secret: {}\ndebug: false\ndisable_auto_update: true\ndisable_command_execute: false\ndisable_force_update: true\ndisable_nat: false\ndisable_send_query: false\ngpu: false\ninsecure_tls: true\nip_report_period: 1800\nreport_delay: 4\nserver: {}\nskip_connection_count: true\nskip_procs_count: true\ntemperature: false\ntls: {}\nuse_gitee_to_upgrade: false\nuse_ipv6_country_code: false\nuuid: {}",
-                cfg.nezha_key, cfg.nezha_server, tls, cfg.uuid
-            );
-            let yaml_file = base_path.join("config.yaml");
-            fs::write(&yaml_file, config_yaml).await?;
-            run_bg(&php_path, &["-c", yaml_file.to_str().unwrap()]).await?;
+    if is_valid_port(&state.config.reality_port) {
+        let pub_path = state.config.file_path.join("public_key.txt");
+        let pub_key = if let Ok(content) = tokio_fs::read_to_string(&pub_path).await {
+            content.trim().to_string()
         } else {
-            let mut args = vec![
-                "-s", &format!("{}:{}", cfg.nezha_server, cfg.nezha_port),
-                "-p", &cfg.nezha_key,
-                "--disable-auto-update", "--report-delay", "4", "--skip-conn", "--skip-procs"
-            ];
-            if ["443","8443","2096","2087","2083","2053"].contains(&cfg.nezha_port.as_str()) {
-                args.push("--tls");
-            }
-            run_bg(&npm_path, &args.iter().map(|s| *s).collect::<Vec<&str>>()).await?;
-        }
-        info!("Nezha agent started");
+            let (_, pub_key) = generate_or_load_keypair(&state.config.file_path);
+            pub_key
+        };
+        sub_lines.push(format!(
+            "vless://{}@{}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={}&type=tcp&headerType=none#{}",
+            state.config.uuid,
+            server_ip,
+            state.config.reality_port,
+            pub_key,
+            node_name
+        ));
     }
 
-    let mut argo_args = vec!["tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--protocol", "http2"];
-    if !cfg.argo_auth.is_empty() && !cfg.argo_domain.is_empty() {
-        if cfg.argo_auth.len() >= 120 && cfg.argo_auth.len() <= 250 && cfg.argo_auth.chars().all(|c| c.is_ascii_alphanumeric() || c == '=') {
-            argo_args.extend_from_slice(&["run", "--token", &cfg.argo_auth]);
-        } else if cfg.argo_auth.contains("TunnelSecret") {
-            let tunnel_id = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cfg.argo_auth) {
-                json_val["TunnelSecret"]["tunnel_id"]
-                    .as_str()
-                    .unwrap_or_else(|| {
-                        warn!("Could not find tunnel_id in JSON, using fallback");
-                        cfg.argo_auth.split('"').nth(11).unwrap_or("")
-                    })
-            } else {
-                warn!("Failed to parse ARGO_AUTH JSON, using fallback");
-                cfg.argo_auth.split('"').nth(11).unwrap_or("")
-            };
-            let tunnel_json = base_path.join("tunnel.json");
-            fs::write(&tunnel_json, &cfg.argo_auth).await?;
-            let tunnel_yaml = format!(
-                "tunnel: {}\ncredentials-file: {}\nprotocol: http2\n\ningress:\n  - hostname: {}\n    service: http://localhost:{}\n    originRequest:\n      noTLSVerify: true\n  - service: http_status:404\n",
-                tunnel_id,
-                tunnel_json.display(),
-                cfg.argo_domain,
-                cfg.argo_port
-            );
-            fs::write(base_path.join("tunnel.yml"), tunnel_yaml).await?;
-            argo_args.extend_from_slice(&["--config", base_path.join("tunnel.yml").to_str().unwrap(), "run"]);
+    if is_valid_port(&state.config.s5_port) {
+        let auth = BASE64.encode(format!("{}:{}", &state.config.uuid[0..8], &state.config.uuid[12..]));
+        sub_lines.push(format!(
+            "socks://{}@{}:{}#{}",
+            auth, server_ip, state.config.s5_port, node_name
+        ));
+    }
+
+    let sub_text = sub_lines.join("\n");
+    let sub_b64 = BASE64.encode(&sub_text);
+    let sub_path = state.config.file_path.join("sub.txt");
+    tokio_fs::write(&sub_path, &sub_b64).await?;
+    let list_path = state.config.file_path.join("list.txt");
+    tokio_fs::write(&list_path, &sub_text).await?;
+
+    Ok(sub_b64)
+}
+
+// ========== 上传节点/订阅 ==========
+async fn upload_nodes(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let upload_url = &state.config.upload_url;
+    if upload_url.is_empty() {
+        return Ok(());
+    }
+    let project_url = &state.config.project_url;
+    if !project_url.is_empty() {
+        let sub_url = format!("{}/{}", project_url, state.config.sub_path);
+        let payload = json!({ "subscription": [sub_url] });
+        let resp = state
+            .client
+            .post(format!("{}/api/add-subscriptions", upload_url))
+            .json(&payload)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            info!("订阅上传成功");
         } else {
-            warn!("Invalid ARGO_AUTH format, using quick tunnel");
-            argo_args.extend_from_slice(&["--logfile", boot_log.to_str().unwrap(), "--loglevel", "info", "--url", &format!("http://localhost:{}", cfg.argo_port)]);
+            warn!("订阅上传失败: {}", resp.status());
         }
-    } else {
-        argo_args.extend_from_slice(&["--logfile", boot_log.to_str().unwrap(), "--loglevel", "info", "--url", &format!("http://localhost:{}", cfg.argo_port)]);
+        return Ok(());
     }
-    run_bg(&bot_path, &argo_args.iter().map(|s| *s).collect::<Vec<&str>>()).await?;
-    info!("Argo tunnel started");
 
-    sleep(Duration::from_secs(6)).await;
-
-    let argo_domain = if !cfg.argo_domain.is_empty() {
-        cfg.argo_domain.clone()
+    let list_path = state.config.file_path.join("list.txt");
+    if !list_path.exists() {
+        return Ok(());
+    }
+    let content = tokio_fs::read_to_string(&list_path).await?;
+    let nodes: Vec<&str> = content
+        .lines()
+        .filter(|line| line.contains("://"))
+        .collect();
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let payload = json!({ "nodes": nodes });
+    let resp = state
+        .client
+        .post(format!("{}/api/add-nodes", upload_url))
+        .json(&payload)
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        info!("节点上传成功");
     } else {
-        let mut retries = 3;
-        let mut domain = None;
-        while retries > 0 && domain.is_none() {
-            sleep(Duration::from_secs(3)).await;
-            if let Ok(log) = fs::read_to_string(&boot_log).await {
-                let re = regex::Regex::new(r"https?://([^ ]*trycloudflare\.com)")?;
-                if let Some(cap) = re.captures(&log) {
-                    domain = Some(cap[1].to_string());
-                }
-            }
-            retries -= 1;
+        warn!("节点上传失败: {}", resp.status());
+    }
+    Ok(())
+}
+
+// ========== Telegram 推送（含完整转义） ==========
+fn escape_markdown_v2(text: &str) -> String {
+    let special_chars = r#"_*[]()~`>#+=|{}.!-\\"#;
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        if special_chars.contains(ch) {
+            escaped.push('\\');
         }
-        domain.ok_or_else(|| anyhow::anyhow!("Could not extract Argo domain"))?
-    };
-    info!("Argo domain: {}", argo_domain);
+        escaped.push(ch);
+    }
+    escaped
+}
 
-    let server_ip = get_server_ip().await?;
-    info!("Server IP: {}", server_ip);
-
-    let list_content = generate_links(&cfg, &argo_domain, &server_ip, &public_key_str).await?;
-    let sub_b64 = BASE64.encode(&list_content);
-    fs::write(&sub_file, &sub_b64).await?;
-    fs::write(&list_file, &list_content).await?;
-    info!("Subscription saved to {}", sub_file.display());
-
-    let sub_content = sub_b64.clone();
-    let sub_path_route = cfg.sub_path.clone();
-    let port = cfg.port;
-    let static_html = "Hello world!<br><br>You can access /{SUB_PATH} to get your nodes!";
-    let html_path = Path::new("index.html");
-    let html_content = if html_path.exists() {
-        fs::read_to_string(html_path).await.unwrap_or_else(|_| static_html.to_string())
+async fn send_telegram(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    if state.config.bot_token.is_empty() || state.config.chat_id.is_empty() {
+        return Ok(());
+    }
+    let sub_path = state.config.file_path.join("sub.txt");
+    if !sub_path.exists() {
+        return Ok(());
+    }
+    let content = tokio_fs::read_to_string(&sub_path).await?;
+    let escaped_name = escape_markdown_v2(&state.config.name);
+    let text = format!("**{}节点推送**\n```\n{}\n```", escaped_name, content);
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", state.config.bot_token);
+    let params = [
+        ("chat_id", state.config.chat_id.as_str()),
+        ("text", &text),
+        ("parse_mode", "MarkdownV2"),
+    ];
+    let resp = state.client.post(&url).form(&params).send().await?;
+    if resp.status().is_success() {
+        info!("Telegram 推送成功");
     } else {
-        static_html.to_string()
+        warn!("Telegram 推送失败: {}", resp.status());
+    }
+    Ok(())
+}
+
+// ========== 自动访问任务 ==========
+async fn add_visit_task(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    if !state.config.auto_access || state.config.project_url.is_empty() {
+        return Ok(());
+    }
+    let url = "https://oooo.serv00.net/add-url";
+    let payload = json!({ "url": state.config.project_url });
+    let resp = state.client.post(url).json(&payload).send().await?;
+    if resp.status().is_success() {
+        info!("自动访问任务添加成功");
+    } else {
+        warn!("自动访问任务添加失败: {}", resp.status());
+    }
+    Ok(())
+}
+
+// ========== 延迟清理任务（90 秒后删除临时文件） ==========
+async fn cleanup_task(state: AppState) {
+    sleep(Duration::from_secs(90)).await;
+    let files = [
+        "boot.log",
+        "config.json",
+        "web",
+        "bot",
+        "list.txt",
+        "cert.pem",
+        "private.key",
+        "agent",
+        "v1",
+        "tunnel.json",
+        "tunnel.yml",
+        "config.yaml",
+        "key.txt",
+        "public_key.txt",
+    ];
+    for name in files.iter() {
+        let path = state.config.file_path.join(name);
+        if path.exists() {
+            let _ = tokio_fs::remove_file(&path).await;
+        }
+    }
+    print!("\x1B[2J\x1B[1;1H");
+    info!("App is running");
+}
+
+// ========== HTTP 根路由（读取 index.html） ==========
+async fn root_handler() -> impl IntoResponse {
+    match tokio_fs::read_to_string("index.html").await {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => Html("Hello world!<br><br>You can access /sub to get your nodes!").into_response(),
+    }
+}
+
+// ========== HTTP 订阅路由 ==========
+async fn sub_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let sub = state.sub_content.lock().await;
+    if let Some(ref content) = *sub {
+        (StatusCode::OK, content.clone())
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Subscription content not yet available".to_string(),
+        )
+    }
+}
+
+// ========== 主函数 ==========
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_env();
+
+    // 根据 SHOW_LOG 控制日志级别
+    let filter = if config.show_log {
+        EnvFilter::new("info")
+    } else {
+        EnvFilter::new("off")
     };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .init();
+
+    ensure_dir(&config.file_path).await?;
+
+    let state = AppState {
+        config: config.clone(),
+        client: Client::new(),
+        sub_content: Arc::new(Mutex::new(None)),
+    };
+
+    // 1. 删除上游旧节点（读取已有的 sub.txt）
+    delete_nodes(&state).await?;
+
+    // 2. 清空 .tmp 目录
+    cleanup_old_files(&config).await?;
+
+    // 3. 生成 config.json
+    generate_config(&state).await?;
+
+    // 4. 下载并运行二进制
+    download_and_run(&state).await?;
+
+    // 5. 提取 Argo 域名
+    let argo_domain = extract_argo_domain(&state)
+        .await
+        .unwrap_or_else(|| "localhost".to_string());
+    info!("Argo 域名: {}", argo_domain);
+
+    // 6. 生成订阅内容
+    let sub_content = generate_subscription(&state, &argo_domain).await?;
+    {
+        let mut sub_guard = state.sub_content.lock().await;
+        *sub_guard = Some(sub_content);
+    }
+
+    // 7. 上传节点/订阅
+    upload_nodes(&state).await?;
+
+    // 8. Telegram 推送
+    send_telegram(&state).await?;
+
+    // 9. 添加自动访问任务
+    add_visit_task(&state).await?;
+
+    // 10. 启动延迟清理任务
+    let state_clone = state.clone();
     tokio::spawn(async move {
-        let app = Router::new()
-            .route(&format!("/{}", sub_path_route), get(move || async move {
-                if sub_content.is_empty() {
-                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not ready".to_string())
-                } else {
-                    (axum::http::StatusCode::OK, sub_content.clone())
-                }
-            }))
-            .route("/", get(move || async move {
-                (axum::http::StatusCode::OK, html_content.clone())
-            }));
-        let addr = format!("0.0.0.0:{}", port).parse().unwrap();
-        info!("HTTP server running on {}", addr);
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        cleanup_task(state_clone).await;
     });
 
-    upload_nodes(&cfg, &sub_b64, &list_content).await?;
-    send_telegram(&cfg, &sub_b64).await?;
-    add_visit_task(&cfg).await?;
+    // 11. 启动 HTTP 服务器
+    let app = Router::new()
+        .route("/", get(root_handler))
+        .route(&format!("/{}", config.sub_path), get(sub_handler))
+        .with_state(state);
 
-    let files_to_clean = vec![web_path, bot_path, npm_path, php_path, boot_log, config_file];
-    tokio::spawn(async move {
-        sleep(Duration::from_secs(90)).await;
-        cleanup_files(&files_to_clean).await;
-        info!("Cleaned up temporary files");
-    });
+    let addr = format!("0.0.0.0:{}", config.port);
+    info!("HTTP 服务器监听 {}", addr);
+    axum::Server::bind(&addr.parse()?)
+        .serve(app.into_make_service())
+        .await?;
 
-    loop {
-        sleep(Duration::from_secs(60)).await;
-    }
+    Ok(())
 }
